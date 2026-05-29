@@ -101,10 +101,20 @@ pub fn collect_simple_message_ids(
 /// - Messages with an empty ID
 /// - Status broadcasts (`status@broadcast`)
 /// - Newsletter messages
-/// - Own outgoing messages (unless category is `"peer"`, i.e., self-synced)
+/// - Own outgoing messages, EXCEPT category `"peer"` (self-synced) and
+///   self-fanouts (`is_from_me` with a `recipient`), which need a
+///   `<receipt type="sender">`.
 ///
-/// WA Web sends `type="peer_msg"` delivery receipts for self-synced messages
-/// (category="peer"). For all other messages, receipts are skipped for our own.
+/// WA Web sends `type="peer_msg"` for self-synced and `type="sender"` for
+/// own-account fanouts (`isMeAccount(author)`). For all other own messages,
+/// receipts are skipped.
+///
+/// NOTE: the message-dispatch hot path uses
+/// `crate::client::Client::should_send_delivery_receipt` (in the
+/// `whatsapp-rust` crate), which is authoritative and intentionally diverges
+/// here (it also sends `<receipt context="status">` for status broadcasts,
+/// which this copy still skips). The self-fanout rule is shared via
+/// [`MessageSource::is_self_fanout`].
 pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
     if info.id.is_empty()
         || info.source.chat.user == STATUS_BROADCAST_USER
@@ -113,11 +123,11 @@ pub fn should_send_delivery_receipt(info: &MessageInfo) -> bool {
         return false;
     }
 
-    // WA Web sends type="peer_msg" delivery receipts for self-synced
-    // messages (category="peer").  These tell the primary phone that
-    // this companion device received the message.
-    // For all other messages, skip receipts for our own messages.
-    info.category == MessageCategory::Peer || !info.source.is_from_me
+    // WA Web sends type="peer_msg" for self-synced (category="peer") and
+    // type="sender" for own-account fanouts. Other own messages are skipped.
+    info.category == MessageCategory::Peer
+        || !info.source.is_from_me
+        || info.source.is_self_fanout()
 }
 
 #[cfg(test)]
@@ -200,6 +210,58 @@ mod tests {
             ..Default::default()
         };
         assert!(should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn allow_self_fanout_with_recipient() {
+        // Own outgoing message echoed back (is_from_me + recipient): needs a
+        // sender receipt. A recipient-less own message (skip_own_non_peer_*)
+        // stays skipped. Mirrors the hot-path copy in the whatsapp-rust crate.
+        let info = MessageInfo {
+            id: "FANOUT1".to_string(),
+            source: MessageSource {
+                chat: "200000000000002@bot".parse().unwrap(),
+                sender: "100000000000001@lid".parse().unwrap(),
+                recipient: Some("200000000000002@bot".parse().unwrap()),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(should_send_delivery_receipt(&info));
+    }
+
+    #[test]
+    fn skip_own_status_and_group_even_with_recipient() {
+        // Negative parity with Client::should_send_delivery_receipt: the
+        // self-fanout allowance must NOT leak into own status broadcasts or
+        // group messages, even when a recipient is present.
+        let own_status = MessageInfo {
+            id: "OWN_STATUS".to_string(),
+            source: MessageSource {
+                chat: "status@broadcast".parse().unwrap(),
+                sender: "100000000000001@lid".parse().unwrap(),
+                recipient: Some("100000000000001@lid".parse().unwrap()),
+                is_from_me: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!should_send_delivery_receipt(&own_status));
+
+        let own_group = MessageInfo {
+            id: "OWN_GROUP".to_string(),
+            source: MessageSource {
+                chat: "120363021033254949@g.us".parse().unwrap(),
+                sender: "100000000000001@lid".parse().unwrap(),
+                recipient: Some("100000000000001@lid".parse().unwrap()),
+                is_from_me: true,
+                is_group: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert!(!should_send_delivery_receipt(&own_group));
     }
 
     #[test]

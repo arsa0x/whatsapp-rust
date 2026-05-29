@@ -56,6 +56,31 @@ impl MessageSource {
     pub fn is_incoming_broadcast(&self) -> bool {
         (!self.is_from_me || self.broadcast_list_owner.is_some()) && self.chat.is_broadcast_list()
     }
+
+    /// Our own outgoing DM to a user or bot, echoed back to this device
+    /// (`is_from_me` with a `recipient`). The server's offline queue only
+    /// releases these on a `<receipt type="sender">`, so they must not be
+    /// cleared with a bare transport ack. Group/status/newsletter threads are
+    /// excluded (`chat` is checked too, since the own-from parser derives
+    /// `chat` from `recipient` and leaves `is_group` defaulted).
+    pub fn is_self_fanout(&self) -> bool {
+        self.is_from_me
+            && self.recipient.is_some()
+            && !self.is_group
+            && !self.chat.is_group()
+            && !self.chat.is_status_broadcast()
+            && !self.chat.is_newsletter()
+    }
+
+    /// The author is a bot but the chat is not a bot chat (WA Web's
+    /// `h = !chat.isBot() && author.isBot()`). WA Web clears these with a
+    /// bot-invoke-response `<ack>` (`sendBotInvokeResponseAcks`), NOT a
+    /// `<receipt>`, so both the success/duplicate ack path and the
+    /// decrypt-failure path must route them to the bare ack, not the sender
+    /// receipt, even though such an own message is also an [`Self::is_self_fanout`].
+    pub fn is_bot_authored_non_bot_chat(&self) -> bool {
+        !self.chat.is_bot() && self.sender.is_bot()
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -266,6 +291,55 @@ impl MessageInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_self_fanout_matches_only_own_dm_with_recipient() {
+        let bot = MessageSource {
+            chat: "200000000000002@bot".parse().unwrap(),
+            sender: "100000000000001@lid".parse().unwrap(),
+            recipient: Some("200000000000002@bot".parse().unwrap()),
+            is_from_me: true,
+            ..Default::default()
+        };
+        assert!(bot.is_self_fanout(), "own prompt to a @bot");
+
+        let mut user = bot.clone();
+        user.chat = "300000000000003@lid".parse().unwrap();
+        user.recipient = Some("300000000000003@lid".parse().unwrap());
+        assert!(user.is_self_fanout(), "own DM to a user");
+
+        let mut incoming = bot.clone();
+        incoming.is_from_me = false;
+        assert!(!incoming.is_self_fanout(), "incoming is not a self-fanout");
+
+        let mut note = bot.clone();
+        note.recipient = None;
+        assert!(!note.is_self_fanout(), "recipient-less self-note");
+
+        // Load-bearing guard: the own-from parser leaves is_group=false and
+        // derives chat from recipient, so a group/status/newsletter self-echo
+        // must be excluded by the chat-based checks alone.
+        let mut group_chat = bot.clone();
+        group_chat.chat = "120363021033254949@g.us".parse().unwrap();
+        group_chat.recipient = Some("120363021033254949@g.us".parse().unwrap());
+        assert!(!group_chat.is_group);
+        assert!(
+            !group_chat.is_self_fanout(),
+            "group chat excluded by chat.is_group() even with is_group=false"
+        );
+
+        let mut group_flag = bot.clone();
+        group_flag.is_group = true;
+        assert!(!group_flag.is_self_fanout(), "is_group flag excludes");
+
+        let mut status = bot.clone();
+        status.chat = "status@broadcast".parse().unwrap();
+        assert!(!status.is_self_fanout(), "status broadcast excluded");
+
+        let mut newsletter = bot.clone();
+        newsletter.chat = "120363298765432100@newsletter".parse().unwrap();
+        assert!(!newsletter.is_self_fanout(), "newsletter excluded");
+    }
 
     #[test]
     fn test_edit_attribute_parsing_and_serialization() {
