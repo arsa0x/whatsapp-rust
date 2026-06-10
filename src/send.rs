@@ -781,21 +781,18 @@ impl Client {
     /// For LID mode, uses `group_info.phone_jid_for_lid_user` to query devices
     /// via PN when available (LID usync is unreliable for own JID), then
     /// converts the result back to LID. Same fallback as `prepare_group_stanza`.
-    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
-    async fn resolve_skdm_targets(
+    /// Load (or lazily build) the per-group sender-key device map.
+    ///
+    /// Atomic get-or-init: if another task invalidated the cache during our
+    /// DB read, get_or_init's single-flight guarantee means the stale data
+    /// won't be inserted — the invalidation wins and the next caller re-inits.
+    async fn skdm_device_map(
         &self,
         group_jid: &str,
-        group_info: &wacore::client::context::GroupInfo,
-        own_sending_jid: &Jid,
-    ) -> Option<(Vec<Jid>, Vec<Jid>)> {
+    ) -> std::sync::Arc<crate::sender_key_device_cache::SenderKeyDeviceMap> {
         use crate::sender_key_device_cache::SenderKeyDeviceMap;
-
-        // Atomic get-or-init: if another task invalidated the cache during our
-        // DB read, get_or_init's single-flight guarantee means the stale data
-        // won't be inserted — the invalidation wins and the next caller re-inits.
         let pm = self.persistence_manager.clone();
-        let cached_map = self
-            .sender_key_device_cache
+        self.sender_key_device_cache
             .get_or_init(group_jid, async {
                 let db_rows = pm
                     .get_sender_key_devices(group_jid)
@@ -810,10 +807,58 @@ impl Client {
                     });
                 std::sync::Arc::new(SenderKeyDeviceMap::from_db_rows(&db_rows))
             })
-            .await;
+            .await
+    }
 
-        // No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
-        // as `false` per participant, so the filter below must run unconditionally.
+    /// Filter the resolved device set down to the subset still needing SKDM.
+    ///
+    /// No empty-cache early-exit: WA Web iterates an empty `senderKey` Map
+    /// as `false` per participant, so the filter must run unconditionally.
+    fn filter_skdm_targets(
+        &self,
+        group_jid: &str,
+        all_devices: &[Jid],
+        cached_map: &crate::sender_key_device_cache::SenderKeyDeviceMap,
+        own_sending_jid: &Jid,
+    ) -> Vec<Jid> {
+        let needs_skdm: Vec<Jid> = all_devices
+            .iter()
+            .filter(|device| {
+                if device.is_hosted() {
+                    return false;
+                }
+                if device.user == own_sending_jid.user && device.device == own_sending_jid.device {
+                    return false;
+                }
+                // O(1) lookups into pre-indexed cache
+                !cached_map
+                    .device_has_key(&device.user, device.device)
+                    .unwrap_or(false)
+                    || cached_map.is_user_forgotten(&device.user)
+            })
+            .cloned()
+            .collect();
+
+        log::debug!(
+            "Resolved {} devices ({} need SKDM) for {}",
+            all_devices.len(),
+            needs_skdm.len(),
+            group_jid
+        );
+        needs_skdm
+    }
+
+    /// SKDM target resolution for the status path, whose `GroupInfo` is built
+    /// fresh per send (no stable identity to memoize against).
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets", level = "debug", skip_all, fields(group = %wacore_binary::jid::observe_str(group_jid))))]
+    async fn resolve_skdm_targets(
+        &self,
+        group_jid: &str,
+        group_info: &wacore::client::context::GroupInfo,
+        own_sending_jid: &Jid,
+    ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
+        let cached_map = self.skdm_device_map(group_jid).await;
+
         let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
         let jids_to_resolve: Vec<Jid> = group_info
             .participants
@@ -839,36 +884,41 @@ impl Client {
                 } else {
                     all_devices
                 };
-
-                // Borrow for the filter so `all_devices` survives to feed the
-                // phash (the full set), while `needs_skdm` is just the subset
-                // still missing the key.
-                let needs_skdm: Vec<Jid> = all_devices
-                    .iter()
-                    .filter(|device| {
-                        if device.is_hosted() {
-                            return false;
-                        }
-                        if device.user == own_sending_jid.user
-                            && device.device == own_sending_jid.device
-                        {
-                            return false;
-                        }
-                        // O(1) lookups into pre-indexed cache
-                        !cached_map
-                            .device_has_key(&device.user, device.device)
-                            .unwrap_or(false)
-                            || cached_map.is_user_forgotten(&device.user)
-                    })
-                    .cloned()
-                    .collect();
-
-                log::debug!(
-                    "Resolved {} devices ({} need SKDM) for {}",
-                    all_devices.len(),
-                    needs_skdm.len(),
-                    group_jid
+                let all_devices = std::sync::Arc::new(all_devices);
+                let needs_skdm =
+                    self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
+                Some((all_devices, needs_skdm))
+            }
+            Err(e) => {
+                log::warn!(
+                    "Failed to resolve devices for SKDM check in {}: {:?}",
+                    group_jid,
+                    e
                 );
+                None
+            }
+        }
+    }
+
+    /// SKDM target resolution for cached-group sends: the full device set
+    /// comes from the per-group memo (`resolve_group_devices_memoized`), so a
+    /// warm repeat send skips the per-member registry fan-out entirely.
+    #[cfg_attr(feature = "tracing", tracing::instrument(name = "wa.send.resolve_skdm_targets_memoized", level = "debug", skip_all, fields(group = %group_jid)))]
+    async fn resolve_skdm_targets_memoized(
+        &self,
+        group: &Jid,
+        group_jid: &str,
+        group_info: &std::sync::Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Option<(std::sync::Arc<Vec<Jid>>, Vec<Jid>)> {
+        let cached_map = self.skdm_device_map(group_jid).await;
+        match self
+            .resolve_group_devices_memoized(group, group_info, own_sending_jid)
+            .await
+        {
+            Ok(all_devices) => {
+                let needs_skdm =
+                    self.filter_skdm_targets(group_jid, &all_devices, &cached_map, own_sending_jid);
                 Some((all_devices, needs_skdm))
             }
             Err(e) => {
@@ -1309,6 +1359,11 @@ impl Client {
                 crate::types::message::AddressingMode::Pn => (own_jid.clone(), "pn"),
             };
 
+            // Memo identity must be the CACHED Arc: ensure_self_in_group clones
+            // a fresh GroupInfo whenever self is absent from the snapshot, which
+            // would make the memo miss on every send to such groups. The memoized
+            // resolver applies the same self-append internally.
+            let group_info_for_memo = std::sync::Arc::clone(&group_info);
             // resolve_skdm_targets and prepare_group_stanza both read the
             // participant list and expect self to be present.
             let group_info = ensure_self_in_group(group_info, &own_sending_jid);
@@ -1369,18 +1424,25 @@ impl Client {
             // phash on every group send); `skdm_target_devices` is the subset
             // still missing the key. On the cold/`force_skdm` path both are
             // `None` and `prepare_group_stanza` resolves the set itself.
-            let (all_devices_for_phash, skdm_target_devices): (Option<Vec<Jid>>, Option<Vec<Jid>>) =
-                if force_skdm {
-                    (None, None)
-                } else {
-                    match self
-                        .resolve_skdm_targets(&to_str, &group_info, &own_sending_jid)
-                        .await
-                    {
-                        Some((all, needs)) => (Some(all), Some(needs)),
-                        None => (None, None),
-                    }
-                };
+            let (all_devices_for_phash, skdm_target_devices): (
+                Option<std::sync::Arc<Vec<Jid>>>,
+                Option<Vec<Jid>>,
+            ) = if force_skdm {
+                (None, None)
+            } else {
+                match self
+                    .resolve_skdm_targets_memoized(
+                        &to,
+                        &to_str,
+                        &group_info_for_memo,
+                        &own_sending_jid,
+                    )
+                    .await
+                {
+                    Some((all, needs)) => (Some(all), Some(needs)),
+                    None => (None, None),
+                }
+            };
 
             match wacore::send::prepare_group_stanza(
                 &*self.runtime,
@@ -2867,7 +2929,7 @@ mod tests {
             };
             client
                 .device_registry_cache
-                .insert((*user).into(), Arc::new(record))
+                .raw_insert_for_tests((*user).into(), Arc::new(record))
                 .await;
         }
 

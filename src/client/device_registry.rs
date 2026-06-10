@@ -10,6 +10,23 @@ use wacore_binary::Jid;
 
 use super::Client;
 
+/// Per-group device-list snapshot for `resolve_group_devices_memoized`.
+/// Valid while the producing `GroupInfo` Arc is still the cached one AND the
+/// device-topology generation is unchanged.
+pub(crate) struct GroupDevicesMemo {
+    /// Weak identity of the producing GroupInfo: pointer equality is ABA-safe
+    /// because the Weak keeps the allocation alive, while the heavy data
+    /// (participants, maps) is freed as soon as the metadata cache drops its
+    /// Arc — the memo retains a struct-sized header, not the whole GroupInfo.
+    pub(crate) group_info: std::sync::Weak<wacore::client::context::GroupInfo>,
+    pub(crate) generation: u64,
+    /// Member identifiers in BOTH namespaces (participant users, their mapped
+    /// counterparts, resolved device users): the scoped-invalidation check
+    /// tests the topology log's touched users against this set.
+    pub(crate) members: Arc<std::collections::HashSet<wacore_binary::CompactString>>,
+    pub(crate) devices: Arc<Vec<Jid>>,
+}
+
 /// Result of resolving a user identifier to lookup keys.
 /// This makes the LID/PN relationship explicit instead of using magic indices.
 #[derive(Debug, Clone)]
@@ -59,6 +76,162 @@ impl Client {
             .await
             .canonical_key()
             .to_string()
+    }
+
+    /// Resolve a group's full (LID-converted) device list, memoized per group.
+    ///
+    /// The input set is a pure function of `group_info` (participants + LID
+    /// normalization), so the memo is valid exactly while BOTH hold:
+    /// the same `GroupInfo` snapshot (`Arc` identity — any metadata refresh or
+    /// membership change produces a new `Arc`) and an unchanged
+    /// `device_topology_generation` (any registry/mapping write bumps it).
+    /// On a warm repeat send this turns the per-member cache fan-out
+    /// (2 lookups per participant) into one memo hit.
+    pub(crate) async fn resolve_group_devices_memoized(
+        &self,
+        group: &Jid,
+        group_info: &Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Result<Arc<Vec<Jid>>, anyhow::Error> {
+        // Store-backed registry or mapping caches can be written by OTHER
+        // processes (e.g. shared Redis across pods), which this process's
+        // topology tracker cannot observe; the memo's freshness contract
+        // doesn't hold there, so it is disabled and every send resolves.
+        if !self.group_devices_memo_enabled {
+            return Ok(Arc::new(
+                self.resolve_group_devices_uncached(group_info, own_sending_jid)
+                    .await?,
+            ));
+        }
+        // Load the generation BEFORE resolving (do NOT move this after
+        // get_user_devices): a write racing the resolve bumps it afterwards,
+        // so the memo we store is already stale by its own stamp and the next
+        // read revalidates. Loading after would stamp racing writes as seen
+        // and serve their effects stale.
+        let generation = self.device_topology.current();
+
+        if let Some(memo) = self.group_devices_memo.get(group).await
+            && std::ptr::eq(memo.group_info.as_ptr(), Arc::as_ptr(group_info))
+        {
+            if memo.generation == generation {
+                // Refcount bump: the snapshot is immutable, so a hit shares
+                // it instead of cloning the device Vec.
+                return Ok(Arc::clone(&memo.devices));
+            }
+            // Stale stamp: when every change since it touched only users
+            // outside this group, re-stamp instead of recomputing, so write
+            // storms on unrelated groups don't tank the hit rate. Any doubt
+            // (log overflow, member touched) falls through to the recompute.
+            if self
+                .device_topology
+                .unchanged_for(memo.generation, |user| memo.members.contains(user))
+            {
+                self.group_devices_memo
+                    .insert(
+                        group.clone(),
+                        Arc::new(GroupDevicesMemo {
+                            group_info: memo.group_info.clone(),
+                            generation,
+                            members: Arc::clone(&memo.members),
+                            devices: Arc::clone(&memo.devices),
+                        }),
+                    )
+                    .await;
+                return Ok(Arc::clone(&memo.devices));
+            }
+        }
+
+        let devices = self
+            .resolve_group_devices_uncached(group_info, own_sending_jid)
+            .await?;
+
+        // Member identifiers in both namespaces, so the scoped-invalidation
+        // check can match however a write was keyed: writes record every
+        // resolved lookup alias (see DeviceRegistryCache::insert callers), and
+        // this set carries each member's group-facing identity (participant
+        // user + mapped counterpart) plus the namespace the resolved device
+        // JIDs ended up in.
+        let mut members = std::collections::HashSet::with_capacity(
+            group_info.participants.len() * 2 + devices.len() + 2,
+        );
+        for participant in &group_info.participants {
+            members.insert(participant.user.clone());
+            if participant.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&participant.user)
+            {
+                members.insert(pn.user.clone());
+            } else if let Some(lid) = group_info.lid_user_for_phone_user(&participant.user) {
+                members.insert(lid.clone());
+            }
+        }
+        members.insert(own_sending_jid.user.clone());
+        for device in &devices {
+            members.insert(device.user.clone());
+        }
+
+        let devices = Arc::new(devices);
+        self.group_devices_memo
+            .insert(
+                group.clone(),
+                Arc::new(GroupDevicesMemo {
+                    group_info: Arc::downgrade(group_info),
+                    generation,
+                    members: Arc::new(members),
+                    devices: Arc::clone(&devices),
+                }),
+            )
+            .await;
+        Ok(devices)
+    }
+
+    /// The memo's recompute body: derive the resolve set from `group_info`
+    /// (participants + LID normalization, appending self when the server
+    /// snapshot omitted it — mirroring `ensure_self_in_group`, so keying the
+    /// memo off the pre-ensure Arc stays equivalent) and resolve it.
+    async fn resolve_group_devices_uncached(
+        &self,
+        group_info: &Arc<wacore::client::context::GroupInfo>,
+        own_sending_jid: &Jid,
+    ) -> Result<Vec<Jid>, anyhow::Error> {
+        let is_lid_mode = group_info.addressing_mode == wacore::types::message::AddressingMode::Lid;
+        let mut jids_to_resolve: Vec<Jid> = group_info
+            .participants
+            .iter()
+            .map(|jid| {
+                if is_lid_mode
+                    && jid.is_lid()
+                    && let Some(pn) = group_info.phone_jid_for_lid_user(&jid.user)
+                {
+                    return pn.to_non_ad();
+                }
+                jid.to_non_ad()
+            })
+            .collect();
+        if !group_info
+            .participants
+            .iter()
+            .any(|participant| wacore_binary::JidExt::is_same_user_as(participant, own_sending_jid))
+        {
+            let own = if is_lid_mode
+                && own_sending_jid.is_lid()
+                && let Some(pn) = group_info.phone_jid_for_lid_user(&own_sending_jid.user)
+            {
+                pn.to_non_ad()
+            } else {
+                own_sending_jid.to_non_ad()
+            };
+            jids_to_resolve.push(own);
+        }
+
+        let mut devices = self.get_user_devices(&jids_to_resolve).await?;
+        if is_lid_mode {
+            // WA Web expects LID addressing in SKDM <to> nodes for LID groups.
+            devices = devices
+                .into_iter()
+                .map(|d| group_info.phone_device_jid_into_lid(d))
+                .collect();
+        }
+        Ok(devices)
     }
 
     /// Resolve a user identifier to its lookup keys with type information.
@@ -165,7 +338,7 @@ impl Client {
                     // Cache under the record's actual stored key, not our guessed one,
                     // to keep the cache and backend consistent.
                     self.device_registry_cache
-                        .insert(record.user.clone(), Arc::new(record))
+                        .promote(record.user.clone(), Arc::new(record))
                         .await;
                     return has_device;
                 }
@@ -205,8 +378,18 @@ impl Client {
         let record_for_cache = record.clone();
 
         // Use canonical_key directly as cache key (no extra clone)
+        // Record every lookup alias, not just canonical+original: a LID-keyed
+        // update must also touch the mapped PN, or a PN-addressed group's memo
+        // (whose member set only knows the PN side) would re-stamp stale.
         self.device_registry_cache
-            .insert(canonical_key.clone(), Arc::new(record_for_cache))
+            .insert(
+                canonical_key.clone(),
+                Arc::new(record_for_cache),
+                lookup
+                    .all_keys()
+                    .into_iter()
+                    .chain(std::iter::once(original_user.as_str())),
+            )
             .await;
 
         let backend = self.persistence_manager.backend();
@@ -264,8 +447,16 @@ impl Client {
             record.user.clone_from(&canonical_key);
 
             let record_for_cache = record.clone();
+            // Same alias rule as update_device_list: record every lookup key.
             self.device_registry_cache
-                .insert(canonical_key.clone(), Arc::new(record_for_cache))
+                .insert(
+                    canonical_key.clone(),
+                    Arc::new(record_for_cache),
+                    lookup
+                        .all_keys()
+                        .into_iter()
+                        .chain(std::iter::once(original_user.as_str())),
+                )
                 .await;
 
             if canonical_key != original_user {
@@ -343,6 +534,11 @@ impl Client {
             if let Err(e) = self.persistence_manager.backend().delete_devices(key).await {
                 warn!("Failed to delete device registry from DB for {key}: {e}");
             }
+            // Invalidate again after the delete: a concurrent reader that read
+            // the doomed DB row can promote() it back between the first
+            // invalidate and the delete commit (same guard as the canonical
+            // flip path in update_device_list).
+            self.device_registry_cache.invalidate(key).await;
         }
 
         debug!("Invalidated device cache for user: {} ({:?})", user, lookup);
@@ -660,7 +856,7 @@ impl Client {
             match backend.get_devices(key).await {
                 Ok(Some(record)) => {
                     self.device_registry_cache
-                        .insert(record.user.clone(), Arc::new(record.clone()))
+                        .promote(record.user.clone(), Arc::new(record.clone()))
                         .await;
                     return Some(record);
                 }
@@ -715,7 +911,7 @@ impl Client {
                         continue;
                     }
                     self.device_registry_cache
-                        .insert(record.user.clone(), Arc::new(record))
+                        .promote(record.user.clone(), Arc::new(record))
                         .await;
                     return Some(devices);
                 }
@@ -793,12 +989,16 @@ impl Client {
                 record.user = lid.to_string();
 
                 if let Err(e) = backend.update_device_list(record.clone()).await {
+                    // The backend row may have changed even on error, so the
+                    // change is recorded before the early return; the success
+                    // path records once via the fused cache insert below.
+                    self.device_topology.record([pn, lid]);
                     warn!("Failed to migrate device registry to LID: {}", e);
                     return;
                 }
 
                 self.device_registry_cache
-                    .insert(lid.to_string(), Arc::new(record))
+                    .insert(lid.to_string(), Arc::new(record), [lid, pn])
                     .await;
 
                 // Drop the PN-keyed row in both cache and DB. Invalidate
@@ -853,7 +1053,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert(user.into(), Arc::new(record))
+            .raw_insert_for_tests(user.into(), Arc::new(record))
             .await;
     }
 
@@ -891,6 +1091,386 @@ mod tests {
                 .await
                 .is_some(),
             "unmapped PN must resolve via its own record"
+        );
+    }
+
+    /// Locks the three validity gates of the group-devices memo: a repeat
+    /// resolve with the same GroupInfo Arc + generation is a memo hit (proved
+    /// by serving a raw cache change STALE), any topology bump recomputes,
+    /// and a refreshed GroupInfo (new Arc, same content) recomputes.
+    #[tokio::test]
+    async fn group_devices_memo_hits_and_invalidates() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000042@g.us".parse().expect("group jid");
+        let user_a = "5511999990001";
+        let user_b = "5511999990002";
+        setup_device_record(&client, user_a, &[0, 5]).await;
+        setup_device_record(&client, user_b, &[0]).await;
+
+        let group_info = Arc::new(GroupInfo::new(
+            vec![Jid::pn(user_a), Jid::pn(user_b)],
+            AddressingMode::Pn,
+        ));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(first.len(), 3, "0+5 for A, 0 for B");
+
+        // Raw cache write WITHOUT a topology bump: the memo must keep serving
+        // the snapshot (this is what proves the repeat call was a hit and not
+        // a silent recompute).
+        setup_device_record(&client, user_a, &[0]).await;
+        let stale = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(
+            stale, first,
+            "same Arc + same generation must be a memo hit"
+        );
+
+        // A topology change touching a MEMBER invalidates and the recompute
+        // sees the new record.
+        client.device_topology.record([user_a]);
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(fresh.len(), 2, "post-bump resolve must see the raw change");
+
+        // A refreshed GroupInfo (new Arc, identical content) must recompute
+        // even with an unchanged generation.
+        setup_device_record(&client, user_b, &[0, 9]).await;
+        let refreshed_info = Arc::new(GroupInfo::new(
+            vec![Jid::pn(user_a), Jid::pn(user_b)],
+            AddressingMode::Pn,
+        ));
+        let after_refresh = client
+            .resolve_group_devices_memoized(
+                &group,
+                &refreshed_info,
+                &refreshed_info.participants[0],
+            )
+            .await
+            .expect("resolve should succeed");
+        assert_eq!(
+            after_refresh.len(),
+            3,
+            "a new GroupInfo Arc must invalidate the memo by identity"
+        );
+    }
+
+    /// Locks the scoped invalidation: changes touching only OTHER groups'
+    /// users re-stamp the memo (still a hit), a member's change recomputes,
+    /// and the doubt fallbacks (global event, log overflow) recompute.
+    #[tokio::test]
+    async fn group_devices_memo_scoped_invalidation() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000077@g.us".parse().expect("group jid");
+        let user_a = "5511999990011";
+        setup_device_record(&client, user_a, &[0, 5]).await;
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(user_a)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 2);
+
+        // Raw change (not recorded) + changes touching only a NON-member:
+        // the memo must re-stamp and keep serving the snapshot.
+        setup_device_record(&client, user_a, &[0]).await;
+        client.device_topology.record(["5511000000001"]);
+        client.device_topology.record(["5511000000002"]);
+        let stale = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            stale, first,
+            "non-member changes must re-stamp, not recompute"
+        );
+
+        // A member's change recomputes and sees the raw change.
+        client.device_topology.record([user_a]);
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(fresh.len(), 1, "member change must recompute");
+
+        // Global events (mapping cache clear, warm-up) poison the fast path.
+        setup_device_record(&client, user_a, &[0, 5, 9]).await;
+        client.device_topology.record_global();
+        let after_global = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(after_global.len(), 3, "global event must recompute");
+
+        // Log overflow past the memo's stamp: cannot prove cleanliness,
+        // must recompute.
+        setup_device_record(&client, user_a, &[0]).await;
+        for _ in 0..300 {
+            client.device_topology.record(["5511000000003"]);
+        }
+        let after_overflow = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(after_overflow.len(), 1, "log overflow must recompute");
+    }
+
+    /// A mapping add for a member (logged under BOTH its LID and PN keys)
+    /// must invalidate even when the group only knows one namespace.
+    #[tokio::test]
+    async fn group_devices_memo_invalidated_by_member_mapping_change() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000078@g.us".parse().expect("group jid");
+        let pn = "5511999990012";
+        setup_device_record(&client, pn, &[0]).await;
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 1);
+
+        // Raw change, then learn a LID mapping for the member: the add logs
+        // (lid, pn) and the memo's member set carries the PN, so it must
+        // recompute even though the group never saw the LID.
+        setup_device_record(&client, pn, &[0, 7]).await;
+        client
+            .add_lid_pn_mapping(
+                "100000000000077",
+                pn,
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("mapping");
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            fresh.len(),
+            2,
+            "a member's mapping change must invalidate the memo"
+        );
+    }
+
+    /// Review fix: a server group snapshot that omits self used to be
+    /// rebuilt by ensure_self_in_group on every send (fresh Arc), making the
+    /// memo permanently miss. Keying off the pre-ensure Arc and appending
+    /// self inside the derivation keeps the identity stable.
+    #[tokio::test]
+    async fn memo_hits_when_self_missing_from_group_snapshot() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000080@g.us".parse().expect("group jid");
+        let member = "5511999990014";
+        let own = Jid::pn("5511999990015");
+        setup_device_record(&client, member, &[0]).await;
+        setup_device_record(&client, "5511999990015", &[0, 3]).await;
+
+        // Self deliberately absent from the snapshot.
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(member)], AddressingMode::Pn));
+
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &own)
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 3, "member device + own's two devices");
+
+        let second = client
+            .resolve_group_devices_memoized(&group, &group_info, &own)
+            .await
+            .expect("resolve");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "a self-missing group snapshot must still produce memo hits"
+        );
+    }
+
+    /// Codex P2 regression: a PN-addressed group's memo only knows the PN
+    /// side of a member when the cached GroupInfo carries no LID map, but a
+    /// later usync update can arrive keyed by the LID (canonical == original).
+    /// The write must record every lookup alias so the memo recomputes
+    /// instead of re-stamping stale.
+    #[tokio::test]
+    async fn lid_keyed_update_invalidates_pn_group_memo() {
+        use wacore::client::context::GroupInfo;
+        use wacore::types::message::AddressingMode;
+
+        let client = create_test_client().await;
+        let group: Jid = "120363000000000079@g.us".parse().expect("group jid");
+        let pn = "5511999990013";
+        let lid = "100000000000079";
+
+        // Mapping known BEFORE the memo: the canonical record lives under the
+        // LID, while the group only references the member by PN.
+        client
+            .add_lid_pn_mapping(lid, pn, crate::lid_pn_cache::LearningSource::Usync)
+            .await
+            .expect("mapping");
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: pn.into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed record");
+
+        let group_info = Arc::new(GroupInfo::new(vec![Jid::pn(pn)], AddressingMode::Pn));
+        let first = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(first.len(), 1);
+
+        // The update arrives keyed by the LID: canonical == original == LID,
+        // so without the alias rule only the LID would be recorded and the
+        // PN-only member set would re-stamp the stale snapshot.
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: lid.into(),
+                devices: vec![
+                    wacore::store::traits::DeviceInfo {
+                        device_id: 0,
+                        key_index: None,
+                    },
+                    wacore::store::traits::DeviceInfo {
+                        device_id: 11,
+                        key_index: None,
+                    },
+                ],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("LID-keyed update");
+
+        let fresh = client
+            .resolve_group_devices_memoized(&group, &group_info, &group_info.participants[0])
+            .await
+            .expect("resolve");
+        assert_eq!(
+            fresh.len(),
+            2,
+            "a LID-keyed update for a member must invalidate the PN group's memo"
+        );
+    }
+
+    /// Locks the invariant that every device-topology write path bumps the
+    /// generation. patch_device_add/patch_device_remove funnel their writes
+    /// through update_device_list, so the funnel is what is asserted.
+    #[tokio::test]
+    async fn topology_mutators_bump_the_generation() {
+        let client = create_test_client().await;
+        let current_gen = |c: &Arc<Client>| c.device_topology.current();
+
+        let before = current_gen(&client);
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: "5511999990003".into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("update_device_list");
+        assert!(
+            current_gen(&client) > before,
+            "update_device_list must bump"
+        );
+
+        let before = current_gen(&client);
+        client
+            .update_device_lists(vec![wacore::store::traits::DeviceListRecord {
+                user: "5511999990004".into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            }])
+            .await
+            .expect("update_device_lists");
+        assert!(
+            current_gen(&client) > before,
+            "update_device_lists must bump"
+        );
+
+        let before = current_gen(&client);
+        client.invalidate_device_cache("5511999990003").await;
+        assert!(
+            current_gen(&client) > before,
+            "invalidate_device_cache must bump"
+        );
+
+        let before = current_gen(&client);
+        client
+            .add_lid_pn_mapping(
+                "100000000000042",
+                "5511999990004",
+                crate::lid_pn_cache::LearningSource::Usync,
+            )
+            .await
+            .expect("mapping should persist");
+        assert!(
+            current_gen(&client) > before,
+            "add_lid_pn_mapping must bump"
+        );
+
+        // Fresh pair: the record must live under its PN key (no mapping yet)
+        // for the migration to find and move it.
+        client
+            .update_device_list(wacore::store::traits::DeviceListRecord {
+                user: "5511999990005".into(),
+                devices: vec![wacore::store::traits::DeviceInfo {
+                    device_id: 0,
+                    key_index: None,
+                }],
+                timestamp: wacore::time::now_secs(),
+                phash: None,
+                raw_id: None,
+            })
+            .await
+            .expect("seed PN-keyed record");
+        let before = current_gen(&client);
+        client
+            .migrate_device_registry_on_lid_discovery("5511999990005", "100000000000043")
+            .await;
+        assert!(
+            current_gen(&client) > before,
+            "migrate_device_registry_on_lid_discovery must bump"
         );
     }
 
@@ -1209,7 +1789,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".to_string(), Arc::new(record))
+            .raw_insert_for_tests("15551234567".to_string(), Arc::new(record))
             .await;
 
         // Patch: update device 3 key_index to 5
@@ -1300,7 +1880,7 @@ mod tests {
 
         client
             .device_registry_cache
-            .insert(
+            .raw_insert_for_tests(
                 "15551234567".to_string(),
                 Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
             )
@@ -1349,7 +1929,7 @@ mod tests {
 
         client
             .device_registry_cache
-            .insert(
+            .raw_insert_for_tests(
                 "15551234567".to_string(),
                 Arc::new(record_with_raw_id("15551234567", &[0, 5], 1)),
             )
@@ -1666,7 +2246,7 @@ mod tests {
         };
         client
             .device_registry_cache
-            .insert("15551234567".into(), Arc::new(record))
+            .raw_insert_for_tests("15551234567".into(), Arc::new(record))
             .await;
 
         // Warm the sender key device cache
@@ -1921,7 +2501,7 @@ mod tests {
         // the mapping was learned.
         client
             .device_registry_cache
-            .insert(pn.into(), Arc::new(legacy))
+            .raw_insert_for_tests(pn.into(), Arc::new(legacy))
             .await;
 
         setup_lid_pn(&client, lid, pn).await;
