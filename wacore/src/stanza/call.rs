@@ -102,20 +102,18 @@ fn parse_media_offer(
             .iter()
             .filter(|c| c.tag.as_ref() == "to")
         {
+            // A <to> destination must carry a parseable jid; skip a malformed one rather than pushing
+            // `to: None`, which is the bare-<enc> (directly-addressed) sentinel.
             if let Some(enc_node) = to.get_optional_child("enc")
                 && let Some(enc) = parse_offer_enc(enc_node)
-            {
-                // A <to> destination must carry a parseable jid; skip a malformed one rather than
-                // pushing `to: None`, which is the bare-<enc> (directly-addressed) sentinel.
-                if let Some(to_jid) = to
+                && let Some(to_jid) = to
                     .get_attr("jid")
                     .and_then(|v| v.as_str().parse::<Jid>().ok())
-                {
-                    encs.push(OfferRecipientEnc {
-                        to: Some(to_jid),
-                        enc,
-                    });
-                }
+            {
+                encs.push(OfferRecipientEnc {
+                    to: Some(to_jid),
+                    enc,
+                });
             }
         }
     }

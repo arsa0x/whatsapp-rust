@@ -86,6 +86,26 @@ impl StanzaHandler for CallHandler {
                     // dormant pending-outgoing entry so CallHandle::wait_ended() resolves, instead of
                     // leaking the relay/mic task until an unrelated relay timeout. Runs after dismiss
                     // (which reads the registry entry) and before the move into dispatch.
+                    // A <terminate> for a call with no active or pending registry entry is an
+                    // unanswered incoming call the peer gave up on: surface a missed call (WA Web's
+                    // "missed" call-log outcome) alongside the generic event.
+                    #[cfg(feature = "voip")]
+                    if let CallAction::Terminate { .. } = &call.action
+                        && client
+                            .call_registry()
+                            .generation_of(call.action.call_id())
+                            .is_none()
+                    {
+                        client
+                            .core
+                            .event_bus
+                            .dispatch(Event::MissedCall(MissedCall::new(
+                                call.from.clone(),
+                                call.action.call_id().to_string(),
+                                call.timestamp,
+                                MissedReason::Remote,
+                            )));
+                    }
                     #[cfg(feature = "voip")]
                     if matches!(
                         &call.action,
@@ -468,6 +488,51 @@ mod tests {
                 .generation_of("CALL-ID-0001")
                 .is_none(),
             "a peer <terminate> must remove the call from the registry"
+        );
+    }
+
+    // A <terminate> for a call we never answered (no registry entry) surfaces a MissedCall(Remote),
+    // mirroring WA Web's missed-call outcome for an unanswered incoming call.
+    #[cfg(feature = "voip")]
+    #[tokio::test]
+    async fn unanswered_terminate_surfaces_missed_call() {
+        let client = make_client().await;
+        let (handler, rx) = ChannelEventHandler::new();
+        client.register_handler(handler);
+
+        let terminate = NodeBuilder::new("call")
+            .attr("from", fake_caller_lid())
+            .attr("id", "STANZA-TERM")
+            .attr("t", "1766847151")
+            .children([NodeBuilder::new("terminate")
+                .attr("call-creator", fake_caller_lid())
+                .attr("call-id", "CALL-ID-0001")
+                .build()])
+            .build();
+
+        let mut cancelled = false;
+        assert!(
+            CallHandler
+                .handle(
+                    client.clone(),
+                    node_to_owned_ref(&terminate),
+                    &mut cancelled
+                )
+                .await
+        );
+
+        let mut seen = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let Event::MissedCall(m) = &*ev
+                && m.call_id == "CALL-ID-0001"
+                && matches!(m.reason, MissedReason::Remote)
+            {
+                seen = true;
+            }
+        }
+        assert!(
+            seen,
+            "an unanswered <terminate> must surface a MissedCall(Remote)"
         );
     }
 }

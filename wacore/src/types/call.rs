@@ -235,6 +235,9 @@ impl MissedCall {
 pub enum MissedReason {
     /// The offer was replayed from the offline queue on reconnect (server-set `offline` attribute).
     Offline,
+    /// A `<terminate>` arrived for an incoming call we never answered (the peer gave up). Mirrors WA
+    /// Web's "missed" call-log outcome for an unanswered call.
+    Remote,
 }
 
 impl IncomingCall {
