@@ -73,18 +73,21 @@ impl StanzaHandler for CallHandler {
                             MissedReason::Offline,
                         )));
                 } else {
-                    if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
-                        warn!("call: failed to send offer ack receipt: {e}");
-                    }
                     // Track an incoming offer as ringing so only an UNANSWERED <terminate> later
                     // surfaces a missed call; an answered, outgoing, or duplicate terminate must not.
                     // Mirrors WA Web's _ringingCalls. The offline branch above already surfaced its
-                    // own missed-offline, so it is intentionally not marked here.
+                    // own missed-offline, so it is intentionally not marked here. Mark BEFORE the
+                    // offer-ack await: <call> stanzas are processed concurrently, so a fast <terminate>
+                    // for this offer racing the await must see the ringing flag (else its missed-call
+                    // is lost and we'd set a stale flag after the call already ended).
                     #[cfg(feature = "voip")]
                     if is_offer {
                         client
                             .call_registry()
                             .mark_incoming_ringing(call.action.call_id());
+                    }
+                    if is_offer && let Err(e) = send_offer_ack_receipt(&client, &call).await {
+                        warn!("call: failed to send offer ack receipt: {e}");
                     }
                     // Caller-side: key our recv path to the device that actually answered. We dial the
                     // base callee LID, but a companion answers from `:N` and encrypts under its own
