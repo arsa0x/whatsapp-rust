@@ -353,13 +353,35 @@ pub fn get_outbound_relay_endpoints(relay_data: &RelayData) -> Vec<RelayEndpoint
 /// probes, so an offer that carries every endpoint with `auth_token_id=0` has no relaylatency
 /// candidate yet must still connect for media. Prefer a relaylatency candidate, else any non-FNA
 /// endpoint, else the first; otherwise the call is dropped with no media.
+///
+/// At each tier prefer a USABLE endpoint -- one with an IPv4 address to dial AND a token we hold --
+/// so a preferred-but-unusable endpoint doesn't drop a call that a later fallback endpoint in the
+/// same relay block could carry. If nothing is usable, fall back to the prior selection so
+/// `CallConfig::from_relay` still surfaces a precise NoRelayIpv4/NoRelayToken error.
 pub fn get_media_relay_endpoint(relay_data: &RelayData) -> Option<&RelayEndpoint> {
-    relay_data
-        .endpoints
-        .iter()
-        .find(|e| is_outbound_relay_candidate(e))
-        .or_else(|| relay_data.endpoints.iter().find(|e| !e.is_fna))
-        .or_else(|| relay_data.endpoints.first())
+    let usable = |e: &RelayEndpoint| {
+        get_primary_ipv4_address(e).is_some()
+            && relay_data.relay_tokens.get(e.token_id as usize).is_some()
+    };
+    let pick = |usable_only: bool| {
+        relay_data
+            .endpoints
+            .iter()
+            .find(|e| is_outbound_relay_candidate(e) && (!usable_only || usable(e)))
+            .or_else(|| {
+                relay_data
+                    .endpoints
+                    .iter()
+                    .find(|e| !e.is_fna && (!usable_only || usable(e)))
+            })
+            .or_else(|| {
+                relay_data
+                    .endpoints
+                    .iter()
+                    .find(|e| !usable_only || usable(e))
+            })
+    };
+    pick(true).or_else(|| pick(false))
 }
 
 /// Raw 6-byte IPv4:port for relaylatency (prefers the verbatim te2 bytes).
@@ -528,6 +550,32 @@ mod tests {
         let media = get_media_relay_endpoint(&rd).expect("media relay must be selectable");
         assert_eq!(media.relay_name, "for2c01");
         assert!(!media.is_fna);
+    }
+
+    #[test]
+    fn media_relay_skips_unusable_endpoint_for_a_usable_fallback() {
+        let addr = |ip: &str| RelayAddress {
+            protocol: 0,
+            ipv4: Some(ip.into()),
+            ipv6: None,
+            port: 3478,
+        };
+        let ep = |name: &str, token_id: u32, ip: &str| RelayEndpoint {
+            relay_name: name.into(),
+            token_id,
+            auth_token_id: 1, // outbound candidate
+            addresses: vec![addr(ip)],
+            ..RelayEndpoint::default()
+        };
+        // Only token index 0 exists; the preferred (first) endpoint references a missing token, so it
+        // is unusable -- selection must skip it for the usable fallback rather than dropping the call.
+        let rd = RelayData {
+            relay_tokens: vec![vec![0xAA]],
+            endpoints: vec![ep("unusable", 5, "1.2.3.4"), ep("usable", 0, "5.6.7.8")],
+            ..RelayData::default()
+        };
+        let selected = get_media_relay_endpoint(&rd).expect("a usable endpoint must be selectable");
+        assert_eq!(selected.relay_name, "usable");
     }
 
     #[test]
