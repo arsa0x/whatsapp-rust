@@ -188,8 +188,10 @@ mod tests {
         (client, count)
     }
 
+    #[cfg(feature = "voip")]
     struct FailingTransport;
 
+    #[cfg(feature = "voip")]
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl crate::transport::Transport for FailingTransport {
@@ -199,6 +201,7 @@ mod tests {
         async fn disconnect(&self) {}
     }
 
+    #[cfg(feature = "voip")]
     async fn make_client_failing() -> Arc<Client> {
         let client = crate::test_utils::create_test_client().await;
         let socket_transport: Arc<dyn crate::transport::Transport> = Arc::new(FailingTransport);
